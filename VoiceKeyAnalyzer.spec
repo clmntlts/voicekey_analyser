@@ -1,12 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
+sv_ttk_datas = collect_data_files('sv_ttk')
 
 a = Analysis(
     ['analyse_voicekey.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=['pyaudio', 'scipy.signal', 'scipy.io.wavfile', 'scipy.signal.windows', 'scipy.interpolate'],
+    datas=sv_ttk_datas,
+    hiddenimports=['pyaudio', 'scipy.signal', 'scipy.io.wavfile', 'scipy.signal.windows', 'scipy.interpolate', 'sv_ttk'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

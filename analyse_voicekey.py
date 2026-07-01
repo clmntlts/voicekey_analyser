@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import wave
 import pandas as pd
 from pathlib import Path
 from scipy import signal
@@ -11,8 +10,54 @@ from scipy.io import wavfile
 from scipy.signal.windows import hann
 from scipy.interpolate import interp1d
 import os
+import json
 import threading  # CHANGE 3: needed for audio thread
-import pyaudio
+import voice_onset_core as core
+import sv_ttk
+from ui_widgets import add_tooltip, CollapsibleFrame
+
+SESSION_FILENAME = "voicekey_session.json"
+
+
+class NumpyJSONEncoder(json.JSONEncoder):
+    """Allows json.dump to handle the numpy scalar types that flow into
+    file_specific_params/results (onset/offset times are numpy float64,
+    since they come from indexing a numpy array in voice_onset_core)."""
+
+    def default(self, obj):
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
+
+try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    pyaudio = None
+    PYAUDIO_AVAILABLE = False
+
+PARAM_TOOLTIPS = {
+    'nSD': "Combien de fois l'écart-type du bruit de fond le signal doit dépasser pour déclencher la détection. "
+           "Plus élevé = moins de fausses détections mais risque de manquer un début de parole faible.",
+    'minTH': "Seuil plancher exprimé en pourcentage de l'amplitude maximale du fichier. Évite les faux déclenchements "
+             "dans un enregistrement très calme où l'écart-type du bruit est quasi nul.",
+    'min_duration': "Durée pendant laquelle le signal doit rester au-dessus (onset) / en dessous (offset) du seuil "
+                    "pour confirmer la détection. Évite qu'un simple clic ou bruit parasite soit pris pour un début de parole.",
+    'noise_window': "Portion du début de l'enregistrement utilisée pour estimer le niveau de bruit de fond. "
+                    "Doit correspondre à une zone réellement silencieuse.",
+    'search_delay': "Temps ignoré avant de commencer la recherche d'un onset — utile pour éviter de détecter un bip "
+                    "de consigne ou un bruit de démarrage.",
+    'frame_hop': "Paramètres techniques de calcul de l'enveloppe d'amplitude (taille de fenêtre d'analyse et pas entre "
+                 "fenêtres). Les valeurs par défaut conviennent à la plupart des enregistrements de parole.",
+    'highpass': "Supprime les basses fréquences (bourdonnement, bruit de manipulation du micro) sous la fréquence "
+                "choisie, pour améliorer la détection.",
+    'manual_threshold': "Amplitude fixe au-dessus/en dessous de laquelle l'onset/offset est déclenché en mode manuel.",
+}
+
 
 class VoiceKeyAnalyzer:
     def __init__(self, root):
@@ -106,13 +151,31 @@ class VoiceKeyAnalyzer:
         self.offset_sample = None
         self.rms_envelope = None
         self.envelope_times = None
-        
+
+        # Correction manuelle (glisser-déposer), indépendante du mode
+        self.manual_onset_override = None
+        self.manual_offset_override = None
+
         # Cache for performance
         self.cached_envelope = None
         self.cached_envelope_params = None
-        
+
+        # CHANGE 9: explicit generation counter instead of id(self.audio_data) for cache keys
+        self._audio_generation = 0
+
+        # Batch-processing state
+        self._batch_mode = False
+        self._batch_warnings = []
+        self._suppress_batch_warnings = False
+
         self.create_widgets()
-        
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        """Enregistre la session avant de fermer l'application."""
+        self.save_session()
+        self.root.destroy()
+
     def create_widgets(self):
         # Frame principal
         main_frame = ttk.Frame(self.root, padding="10")
@@ -132,7 +195,7 @@ class VoiceKeyAnalyzer:
         left_outer.columnconfigure(0, weight=1)
 
         # Canvas that enables vertical scrolling of the whole left column
-        self._left_canvas = tk.Canvas(left_outer, width=370, highlightthickness=0)
+        self._left_canvas = tk.Canvas(left_outer, width=520, highlightthickness=0)
         self._left_canvas.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.W, tk.E))
 
         left_scrollbar = ttk.Scrollbar(left_outer, orient=tk.VERTICAL,
@@ -168,15 +231,40 @@ class VoiceKeyAnalyzer:
         self._left_canvas.bind_all('<Button-4>', _on_mousewheel_up)
         self._left_canvas.bind_all('<Button-5>', _on_mousewheel_down)
 
-        # === SECTION 1: Sélection de répertoire ===
-        dir_frame = ttk.LabelFrame(left_inner, text="Répertoire", padding="5")
-        dir_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        # === SECTION 1: Fichiers ===
+        files_frame = ttk.LabelFrame(left_inner, text="Fichiers", padding="5")
+        files_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        files_frame.columnconfigure(0, weight=1)
 
-        self.dir_label = ttk.Label(dir_frame, text="Aucun répertoire sélectionné")
-        self.dir_label.grid(row=0, column=0, sticky=tk.W, padx=5)
+        # Bouton sur sa propre ligne: toujours à une position fixe et cliquable,
+        # même si le chemin du répertoire choisi est long.
+        ttk.Button(files_frame, text="Parcourir...", command=self.select_directory).grid(
+            row=0, column=0, sticky=tk.W, padx=5, pady=(0, 2))
 
-        ttk.Button(dir_frame, text="Parcourir...", command=self.select_directory).grid(
-            row=0, column=1, padx=5)
+        self.dir_label = ttk.Label(files_frame, text="Aucun répertoire sélectionné", wraplength=380)
+        self.dir_label.grid(row=1, column=0, sticky=tk.W, padx=5, pady=(0, 5))
+
+        tree_frame = ttk.Frame(files_frame)
+        tree_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
+        tree_frame.columnconfigure(0, weight=1)
+
+        self.file_tree = ttk.Treeview(tree_frame, columns=("status",), show="tree headings", height=10)
+        self.file_tree.heading("#0", text="Fichier")
+        self.file_tree.heading("status", text="Statut")
+        self.file_tree.column("#0", width=140)
+        self.file_tree.column("status", width=90, anchor=tk.CENTER)
+        self.file_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        file_tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.file_tree.yview)
+        file_tree_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.file_tree.configure(yscrollcommand=file_tree_scroll.set)
+
+        self.file_tree.tag_configure('reviewed', foreground='#1a7f37')
+        self.file_tree.tag_configure('customized', foreground='#b8860b')
+        self.file_tree.tag_configure('unreviewed', foreground='')
+
+        self._syncing_tree = False
+        self.file_tree.bind('<<TreeviewSelect>>', self._on_file_tree_select)
 
         # === SECTION 2: Contrôles (all existing widgets unchanged) ===
         control_frame = ttk.LabelFrame(left_inner, text="Contrôles", padding="5")
@@ -190,6 +278,8 @@ class VoiceKeyAnalyzer:
             side=tk.LEFT, padx=2)
         self.play_button = ttk.Button(nav_frame, text="▶ Jouer", command=self.toggle_play)
         self.play_button.pack(side=tk.LEFT, padx=2)
+        if not PYAUDIO_AVAILABLE:
+            self.play_button.config(state='disabled', text="▶ Jouer (indisponible: PortAudio manquant)")
         ttk.Button(nav_frame, text="Suivant ►►", command=self.next_file).pack(
             side=tk.LEFT, padx=2)
         ttk.Button(nav_frame, text="🔄 Reset", command=self.reset_to_default).pack(
@@ -197,10 +287,13 @@ class VoiceKeyAnalyzer:
         
         self.file_label = ttk.Label(control_frame, text="Fichier: -")
         self.file_label.grid(row=1, column=0, columnspan=2, pady=5)
-        
+
+        self.channel_warning_label = ttk.Label(control_frame, text="", foreground='#cc6600', wraplength=380)
+        self.channel_warning_label.grid(row=2, column=0, columnspan=2, pady=(0, 5), sticky=tk.W)
+
         # Cut section
         cut_frame = ttk.LabelFrame(control_frame, text="Découpage du fichier", padding="5")
-        cut_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        cut_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
         ttk.Label(cut_frame, text="Début (ms):").grid(row=0, column=0, sticky=tk.W, pady=2)
         cut_start_entry = ttk.Entry(cut_frame, textvariable=self.cut_start_ms, width=10)
@@ -222,7 +315,7 @@ class VoiceKeyAnalyzer:
         
         # Mode de détection
         mode_frame = ttk.LabelFrame(control_frame, text="Mode de détection", padding="5")
-        mode_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        mode_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
         ttk.Checkbutton(mode_frame, text="Seuils adaptatifs (VOAT recommandé)", 
                        variable=self.adaptive_threshold,
@@ -231,159 +324,179 @@ class VoiceKeyAnalyzer:
         
         # Paramètres adaptatifs (VOAT)
         adaptive_params = ttk.LabelFrame(control_frame, text="Paramètres adaptatifs (VOAT)", padding="5")
-        adaptive_params.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
-        
-        ttk.Label(adaptive_params, text="nSD (écarts-types au-dessus du bruit):").grid(
-            row=0, column=0, sticky=tk.W, pady=2)
+        adaptive_params.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+
+        lbl = ttk.Label(adaptive_params, text="nSD (écarts-types au-dessus du bruit):")
+        lbl.grid(row=0, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['nSD'])
         nsd_frame = ttk.Frame(adaptive_params)
         nsd_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.nsd_scale = ttk.Scale(nsd_frame, from_=1.5, to=8.0, 
+        self.nsd_scale = ttk.Scale(nsd_frame, from_=1.5, to=8.0,
                  variable=self.nSD, orient=tk.HORIZONTAL,
                  command=lambda x: self.update_analysis())
         self.nsd_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.nsd_label = ttk.Label(nsd_frame, text=f"{self.nSD.get():.1f}")
         self.nsd_label.pack(side=tk.LEFT, padx=5)
         self.nSD.trace_add('write', lambda *args: self.nsd_label.config(text=f"{self.nSD.get():.1f}"))
-        
-        ttk.Label(adaptive_params, text="minTH (% du pic):").grid(
-            row=1, column=0, sticky=tk.W, pady=2)
+
+        lbl = ttk.Label(adaptive_params, text="minTH (% du pic):")
+        lbl.grid(row=1, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['minTH'])
         minth_frame = ttk.Frame(adaptive_params)
         minth_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.minth_scale = ttk.Scale(minth_frame, from_=0.05, to=0.40, 
+        self.minth_scale = ttk.Scale(minth_frame, from_=0.05, to=0.40,
                  variable=self.minTH, orient=tk.HORIZONTAL,
                  command=lambda x: self.update_analysis())
         self.minth_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.minth_label = ttk.Label(minth_frame, text=f"{self.minTH.get():.2f}")
         self.minth_label.pack(side=tk.LEFT, padx=5)
         self.minTH.trace_add('write', lambda *args: self.minth_label.config(text=f"{self.minTH.get():.2f}"))
-        
-        ttk.Label(adaptive_params, text="Durée minimale onset (ms):").grid(
-            row=2, column=0, sticky=tk.W, pady=2)
+
+        lbl = ttk.Label(adaptive_params, text="Durée minimale onset (ms):")
+        lbl.grid(row=2, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['min_duration'])
         mindur_frame = ttk.Frame(adaptive_params)
         mindur_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.mindur_scale = ttk.Scale(mindur_frame, from_=10, to=100, 
+        self.mindur_scale = ttk.Scale(mindur_frame, from_=10, to=100,
                  variable=self.min_duration_ms, orient=tk.HORIZONTAL,
                  command=lambda x: self.update_analysis())
         self.mindur_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.mindur_label = ttk.Label(mindur_frame, text=f"{self.min_duration_ms.get():.0f}")
         self.mindur_label.pack(side=tk.LEFT, padx=5)
         self.min_duration_ms.trace_add('write', lambda *args: self.mindur_label.config(text=f"{self.min_duration_ms.get():.0f}"))
-        
-        ttk.Label(adaptive_params, text="Fenêtre bruit initial (ms):").grid(
-            row=3, column=0, sticky=tk.W, pady=2)
-        noise_frame = ttk.Frame(adaptive_params)
-        noise_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.noise_scale = ttk.Scale(noise_frame, from_=20, to=200, 
-                 variable=self.noise_window_ms, orient=tk.HORIZONTAL,
-                 command=lambda x: self.update_analysis())
-        self.noise_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.noise_win_label = ttk.Label(noise_frame, text=f"{self.noise_window_ms.get():.0f}")
-        self.noise_win_label.pack(side=tk.LEFT, padx=5)
-        self.noise_window_ms.trace_add('write', lambda *args: self.noise_win_label.config(text=f"{self.noise_window_ms.get():.0f}"))
-        
-        ttk.Label(adaptive_params, text="Délai avant recherche (ms):").grid(
-            row=4, column=0, sticky=tk.W, pady=2)
-        delay_frame = ttk.Frame(adaptive_params)
-        delay_frame.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.delay_scale = ttk.Scale(delay_frame, from_=0, to=300, 
-                 variable=self.search_delay_ms, orient=tk.HORIZONTAL,
-                 command=lambda x: self.update_analysis())
-        self.delay_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.delay_label = ttk.Label(delay_frame, text=f"{self.search_delay_ms.get():.0f}")
-        self.delay_label.pack(side=tk.LEFT, padx=5)
-        self.search_delay_ms.trace_add('write', lambda *args: self.delay_label.config(text=f"{self.search_delay_ms.get():.0f}"))
-        
-        ttk.Label(adaptive_params, text="Durée minimale offset (ms):").grid(
-            row=5, column=0, sticky=tk.W, pady=2)
+
+        lbl = ttk.Label(adaptive_params, text="Durée minimale offset (ms):")
+        lbl.grid(row=3, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['min_duration'])
         offset_dur_frame = ttk.Frame(adaptive_params)
-        offset_dur_frame.grid(row=5, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.offset_dur_scale = ttk.Scale(offset_dur_frame, from_=10, to=100, 
+        offset_dur_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=2)
+        self.offset_dur_scale = ttk.Scale(offset_dur_frame, from_=10, to=100,
                  variable=self.offset_min_duration_ms, orient=tk.HORIZONTAL,
                  command=lambda x: self.update_analysis())
         self.offset_dur_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.offset_dur_label = ttk.Label(offset_dur_frame, text=f"{self.offset_min_duration_ms.get():.0f}")
         self.offset_dur_label.pack(side=tk.LEFT, padx=5)
         self.offset_min_duration_ms.trace_add('write', lambda *args: self.offset_dur_label.config(text=f"{self.offset_min_duration_ms.get():.0f}"))
-        
+
+        adaptive_advanced = CollapsibleFrame(adaptive_params, "Paramètres avancés")
+        adaptive_advanced.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
+
+        lbl = ttk.Label(adaptive_advanced.body, text="Fenêtre bruit initial (ms):")
+        lbl.grid(row=0, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['noise_window'])
+        noise_frame = ttk.Frame(adaptive_advanced.body)
+        noise_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=2)
+        self.noise_scale = ttk.Scale(noise_frame, from_=20, to=200,
+                 variable=self.noise_window_ms, orient=tk.HORIZONTAL,
+                 command=lambda x: self.update_analysis())
+        self.noise_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.noise_win_label = ttk.Label(noise_frame, text=f"{self.noise_window_ms.get():.0f}")
+        self.noise_win_label.pack(side=tk.LEFT, padx=5)
+        self.noise_window_ms.trace_add('write', lambda *args: self.noise_win_label.config(text=f"{self.noise_window_ms.get():.0f}"))
+
+        lbl = ttk.Label(adaptive_advanced.body, text="Délai avant recherche (ms):")
+        lbl.grid(row=1, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['search_delay'])
+        delay_frame = ttk.Frame(adaptive_advanced.body)
+        delay_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2)
+        self.delay_scale = ttk.Scale(delay_frame, from_=0, to=300,
+                 variable=self.search_delay_ms, orient=tk.HORIZONTAL,
+                 command=lambda x: self.update_analysis())
+        self.delay_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.delay_label = ttk.Label(delay_frame, text=f"{self.search_delay_ms.get():.0f}")
+        self.delay_label.pack(side=tk.LEFT, padx=5)
+        self.search_delay_ms.trace_add('write', lambda *args: self.delay_label.config(text=f"{self.search_delay_ms.get():.0f}"))
+
         self.threshold_info_label = ttk.Label(adaptive_params, text="", foreground='blue')
-        self.threshold_info_label.grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=5)
-        
+        self.threshold_info_label.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=5)
+
         # Paramètres manuels
         manual_frame = ttk.LabelFrame(control_frame, text="Seuils manuels (amplitude)", padding="5")
-        manual_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
-        
-        ttk.Label(manual_frame, text="Seuil onset:").grid(
-            row=0, column=0, sticky=tk.W, pady=2)
+        manual_frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+
+        lbl = ttk.Label(manual_frame, text="Seuil onset:")
+        lbl.grid(row=0, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['manual_threshold'])
         manual_onset_frame = ttk.Frame(manual_frame)
         manual_onset_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.manual_onset_scale = ttk.Scale(manual_onset_frame, from_=0.001, to=0.1, 
+        self.manual_onset_scale = ttk.Scale(manual_onset_frame, from_=0.001, to=0.1,
                                variable=self.manual_onset_threshold, orient=tk.HORIZONTAL,
                                command=lambda x: self.update_analysis())
         self.manual_onset_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.manual_onset_label = ttk.Label(manual_onset_frame, text=f"{self.manual_onset_threshold.get():.3f}")
         self.manual_onset_label.pack(side=tk.LEFT, padx=5)
         self.manual_onset_threshold.trace_add('write', lambda *args: self.manual_onset_label.config(text=f"{self.manual_onset_threshold.get():.3f}"))
-        
-        ttk.Label(manual_frame, text="Seuil offset:").grid(
-            row=1, column=0, sticky=tk.W, pady=2)
+
+        lbl = ttk.Label(manual_frame, text="Seuil offset:")
+        lbl.grid(row=1, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['manual_threshold'])
         manual_offset_frame = ttk.Frame(manual_frame)
         manual_offset_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.manual_offset_scale = ttk.Scale(manual_offset_frame, from_=0.001, to=0.1, 
+        self.manual_offset_scale = ttk.Scale(manual_offset_frame, from_=0.001, to=0.1,
                                 variable=self.manual_offset_threshold, orient=tk.HORIZONTAL,
                                 command=lambda x: self.update_analysis())
         self.manual_offset_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.manual_offset_label = ttk.Label(manual_offset_frame, text=f"{self.manual_offset_threshold.get():.3f}")
         self.manual_offset_label.pack(side=tk.LEFT, padx=5)
         self.manual_offset_threshold.trace_add('write', lambda *args: self.manual_offset_label.config(text=f"{self.manual_offset_threshold.get():.3f}"))
-        
-        ttk.Label(manual_frame, text="Délai avant recherche (ms):").grid(
-            row=2, column=0, sticky=tk.W, pady=2)
-        manual_delay_frame = ttk.Frame(manual_frame)
-        manual_delay_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.manual_delay_scale = ttk.Scale(manual_delay_frame, from_=0, to=300, 
+
+        lbl = ttk.Label(manual_frame, text="Durée minimale onset (ms):")
+        lbl.grid(row=2, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['min_duration'])
+        manual_onset_dur_frame = ttk.Frame(manual_frame)
+        manual_onset_dur_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=2)
+        self.manual_onset_dur_scale = ttk.Scale(manual_onset_dur_frame, from_=10, to=100,
+                 variable=self.min_duration_ms, orient=tk.HORIZONTAL,
+                 command=lambda x: self.update_analysis())
+        self.manual_onset_dur_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.manual_onset_dur_label = ttk.Label(manual_onset_dur_frame, text=f"{self.min_duration_ms.get():.0f}")
+        self.manual_onset_dur_label.pack(side=tk.LEFT, padx=5)
+        self.min_duration_ms.trace_add('write', lambda *args: self.manual_onset_dur_label.config(text=f"{self.min_duration_ms.get():.0f}"))
+
+        lbl = ttk.Label(manual_frame, text="Durée minimale offset (ms):")
+        lbl.grid(row=3, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['min_duration'])
+        manual_offset_dur_frame = ttk.Frame(manual_frame)
+        manual_offset_dur_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=2)
+        self.manual_offset_dur_scale = ttk.Scale(manual_offset_dur_frame, from_=10, to=100,
+                 variable=self.offset_min_duration_ms, orient=tk.HORIZONTAL,
+                 command=lambda x: self.update_analysis())
+        self.manual_offset_dur_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.manual_offset_dur_label = ttk.Label(manual_offset_dur_frame, text=f"{self.offset_min_duration_ms.get():.0f}")
+        self.manual_offset_dur_label.pack(side=tk.LEFT, padx=5)
+        self.offset_min_duration_ms.trace_add('write', lambda *args: self.manual_offset_dur_label.config(text=f"{self.offset_min_duration_ms.get():.0f}"))
+
+        manual_advanced = CollapsibleFrame(manual_frame, "Paramètres avancés")
+        manual_advanced.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
+
+        lbl = ttk.Label(manual_advanced.body, text="Délai avant recherche (ms):")
+        lbl.grid(row=0, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['search_delay'])
+        manual_delay_frame = ttk.Frame(manual_advanced.body)
+        manual_delay_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=2)
+        self.manual_delay_scale = ttk.Scale(manual_delay_frame, from_=0, to=300,
                  variable=self.manual_search_delay_ms, orient=tk.HORIZONTAL,
                  command=lambda x: self.update_analysis())
         self.manual_delay_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.manual_delay_label = ttk.Label(manual_delay_frame, text=f"{self.manual_search_delay_ms.get():.0f}")
         self.manual_delay_label.pack(side=tk.LEFT, padx=5)
         self.manual_search_delay_ms.trace_add('write', lambda *args: self.manual_delay_label.config(text=f"{self.manual_search_delay_ms.get():.0f}"))
-        
-        ttk.Label(manual_frame, text="Durée minimale onset (ms):").grid(
-            row=3, column=0, sticky=tk.W, pady=2)
-        manual_onset_dur_frame = ttk.Frame(manual_frame)
-        manual_onset_dur_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.manual_onset_dur_scale = ttk.Scale(manual_onset_dur_frame, from_=10, to=100, 
-                 variable=self.min_duration_ms, orient=tk.HORIZONTAL,
-                 command=lambda x: self.update_analysis())
-        self.manual_onset_dur_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.manual_onset_dur_label = ttk.Label(manual_onset_dur_frame, text=f"{self.min_duration_ms.get():.0f}")
-        self.manual_onset_dur_label.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(manual_frame, text="Durée minimale offset (ms):").grid(
-            row=4, column=0, sticky=tk.W, pady=2)
-        manual_offset_dur_frame = ttk.Frame(manual_frame)
-        manual_offset_dur_frame.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.manual_offset_dur_scale = ttk.Scale(manual_offset_dur_frame, from_=10, to=100, 
-                 variable=self.offset_min_duration_ms, orient=tk.HORIZONTAL,
-                 command=lambda x: self.update_analysis())
-        self.manual_offset_dur_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.manual_offset_dur_label = ttk.Label(manual_offset_dur_frame, text=f"{self.offset_min_duration_ms.get():.0f}")
-        self.manual_offset_dur_label.pack(side=tk.LEFT, padx=5)
-        
+
         # Filtrage
         filter_frame = ttk.LabelFrame(control_frame, text="Filtrage (appliqué à tous les modes)", padding="5")
-        filter_frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
-        
-        ttk.Checkbutton(filter_frame, text="Filtre passe-haut", 
-                       variable=self.noise_reduction, 
+        filter_frame.grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+
+        ttk.Checkbutton(filter_frame, text="Filtre passe-haut",
+                       variable=self.noise_reduction,
                        command=self.update_analysis).grid(
             row=0, column=0, columnspan=2, sticky=tk.W, pady=2)
-        
-        ttk.Label(filter_frame, text="Fréquence coupure (Hz):").grid(
-            row=1, column=0, sticky=tk.W, pady=2)
+
+        lbl = ttk.Label(filter_frame, text="Fréquence coupure (Hz):")
+        lbl.grid(row=1, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['highpass'])
         highpass_frame = ttk.Frame(filter_frame)
         highpass_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2)
-        self.highpass_scale = ttk.Scale(highpass_frame, from_=50, to=300, 
+        self.highpass_scale = ttk.Scale(highpass_frame, from_=50, to=300,
                  variable=self.highpass_freq, orient=tk.HORIZONTAL,
                  command=lambda x: self.update_analysis())
         self.highpass_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -391,11 +504,15 @@ class VoiceKeyAnalyzer:
         self.highpass_label.pack(side=tk.LEFT, padx=5)
         self.highpass_freq.trace_add('write', lambda *args: self.highpass_label.config(text=f"{self.highpass_freq.get():.0f}"))
 
+        filter_advanced = CollapsibleFrame(filter_frame, "Paramètres avancés")
+        filter_advanced.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
+
         # CHANGE 4c: Add frame_length_ms and hop_length_ms sliders in filter section
-        ttk.Label(filter_frame, text="Longueur trame RMS (ms):").grid(
-            row=2, column=0, sticky=tk.W, pady=2)
-        frame_len_frame = ttk.Frame(filter_frame)
-        frame_len_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=2)
+        lbl = ttk.Label(filter_advanced.body, text="Longueur trame RMS (ms):")
+        lbl.grid(row=0, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['frame_hop'])
+        frame_len_frame = ttk.Frame(filter_advanced.body)
+        frame_len_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=2)
         self.frame_len_scale = ttk.Scale(frame_len_frame, from_=10, to=50,
                  variable=self.frame_length_ms, orient=tk.HORIZONTAL,
                  command=lambda x: [self.invalidate_cache(), self.update_analysis()])
@@ -404,10 +521,11 @@ class VoiceKeyAnalyzer:
         self.frame_len_label.pack(side=tk.LEFT, padx=5)
         self.frame_length_ms.trace_add('write', lambda *args: self.frame_len_label.config(text=f"{self.frame_length_ms.get():.0f}"))
 
-        ttk.Label(filter_frame, text="Pas de trame RMS (ms):").grid(
-            row=3, column=0, sticky=tk.W, pady=2)
-        hop_len_frame = ttk.Frame(filter_frame)
-        hop_len_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=2)
+        lbl = ttk.Label(filter_advanced.body, text="Pas de trame RMS (ms):")
+        lbl.grid(row=1, column=0, sticky=tk.W, pady=2)
+        add_tooltip(lbl, PARAM_TOOLTIPS['frame_hop'])
+        hop_len_frame = ttk.Frame(filter_advanced.body)
+        hop_len_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2)
         self.hop_len_scale = ttk.Scale(hop_len_frame, from_=5, to=20,
                  variable=self.hop_length_ms, orient=tk.HORIZONTAL,
                  command=lambda x: [self.invalidate_cache(), self.update_analysis()])
@@ -415,10 +533,10 @@ class VoiceKeyAnalyzer:
         self.hop_len_label = ttk.Label(hop_len_frame, text=f"{self.hop_length_ms.get():.0f}")
         self.hop_len_label.pack(side=tk.LEFT, padx=5)
         self.hop_length_ms.trace_add('write', lambda *args: self.hop_len_label.config(text=f"{self.hop_length_ms.get():.0f}"))
-        
+
         # Résultats
         results_frame = ttk.LabelFrame(control_frame, text="Résultats", padding="5")
-        results_frame.grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
+        results_frame.grid(row=8, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
         
         self.onset_label = ttk.Label(results_frame, text="Onset: -")
         self.onset_label.grid(row=0, column=0, sticky=tk.W)
@@ -428,10 +546,16 @@ class VoiceKeyAnalyzer:
         
         self.duration_label = ttk.Label(results_frame, text="Durée: -")
         self.duration_label.grid(row=2, column=0, sticky=tk.W)
-        
+
+        self.manual_correction_label = ttk.Label(results_frame, text="", foreground='#1a7f37')
+        self.manual_correction_label.grid(row=3, column=0, sticky=tk.W, pady=(4, 0))
+
+        ttk.Button(results_frame, text="Annuler la correction manuelle",
+                  command=self.undo_manual_correction).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
+
         # Boutons d'action
         action_frame = ttk.Frame(control_frame)
-        action_frame.grid(row=8, column=0, columnspan=2, pady=10)
+        action_frame.grid(row=9, column=0, columnspan=2, pady=10)
         
         ttk.Button(action_frame, text="Sauvegarder ce fichier", 
                   command=self.save_current).pack(side=tk.LEFT, padx=2)
@@ -460,15 +584,23 @@ class VoiceKeyAnalyzer:
         # Activer/désactiver les contrôles selon le mode
         self.toggle_adaptive_mode()
 
+        # Navigation clavier — inactive quand le focus est sur un contrôle qui
+        # utilise lui-même les flèches gauche/droite (champ texte, curseur, liste).
+        self.root.bind('<Left>', lambda e: self._on_arrow_key(self.previous_file))
+        self.root.bind('<Right>', lambda e: self._on_arrow_key(self.next_file))
+
+    def _on_arrow_key(self, action):
+        focused = self.root.focus_get()
+        if isinstance(focused, (tk.Entry, ttk.Entry, ttk.Scale, ttk.Treeview)):
+            return
+        action()
+
     # =========================================================
     # CHANGE 1: Draggable marker methods
     # =========================================================
 
     def _on_marker_press(self, event):
-        """Handle mouse press: start dragging onset/offset marker in manual mode."""
-        # Only active in manual mode
-        if self.adaptive_threshold.get():
-            return
+        """Handle mouse press: start dragging onset/offset marker (both modes)."""
         if event.inaxes != self.ax2:
             return
         if event.xdata is None:
@@ -492,7 +624,7 @@ class VoiceKeyAnalyzer:
         """Handle mouse motion: update marker position and cursor affordance."""
         # Cursor affordance: change cursor near a draggable marker (skip when dragging — cursor already set)
         if self._dragging is None:
-            if not self.adaptive_threshold.get() and event.inaxes == self.ax2 and event.xdata is not None:
+            if event.inaxes == self.ax2 and event.xdata is not None:
                 tol = 0.005
                 onset_dist = abs(event.xdata - self.onset_time) if self.onset_time is not None else np.inf
                 offset_dist = abs(event.xdata - self.offset_time) if self.offset_time is not None else np.inf
@@ -533,10 +665,24 @@ class VoiceKeyAnalyzer:
         self.canvas.draw_idle()
 
     def _on_marker_release(self, event):
-        """Handle mouse release: stop dragging and persist."""
+        """Handle mouse release: stop dragging, record the override, and persist."""
         if self._dragging is not None:
+            if self._dragging == 'onset':
+                self.manual_onset_override = self.onset_time
+            elif self._dragging == 'offset':
+                self.manual_offset_override = self.offset_time
             self._dragging = None
+            self.update_result_labels()
             self.save_current_params()  # Persist the manual adjustment
+            self.save_session()
+
+    def undo_manual_correction(self):
+        """Efface la correction manuelle et revient à la détection automatique/seuils actuels."""
+        self.manual_onset_override = None
+        self.manual_offset_override = None
+        self.save_current_params()
+        self.update_analysis()
+        self.save_session()
 
     # =========================================================
     # CHANGE 3: Playback cursor methods
@@ -604,10 +750,17 @@ class VoiceKeyAnalyzer:
         
         self.cut_start_ms.set(0)
         self.cut_end_ms.set(0)
-        
+
+        # Effacer toute correction manuelle avant de relancer l'analyse, pour
+        # que toggle_adaptive_mode() (qui appelle update_analysis()) ne la réapplique pas.
+        self.manual_onset_override = None
+        self.manual_offset_override = None
+
         self.toggle_adaptive_mode()
         # toggle_adaptive_mode already calls invalidate_cache() and update_analysis() internally
-        
+        self._refresh_file_list()
+        self.save_session()
+
         messagebox.showinfo("Reset", "Paramètres réinitialisés aux valeurs par défaut pour ce fichier")
     
     def toggle_adaptive_mode(self):
@@ -655,7 +808,7 @@ class VoiceKeyAnalyzer:
         try:
             start_ms = float(self.cut_start_ms.get())
             end_ms = float(self.cut_end_ms.get())
-        except ValueError:
+        except (tk.TclError, ValueError):
             messagebox.showwarning("Attention", "Veuillez entrer des valeurs numériques valides")
             return
         
@@ -694,13 +847,20 @@ class VoiceKeyAnalyzer:
         else:
             self.audio_data = source_data[start_sample:].copy()
             cut_desc = f"Découpe appliquée: {start_ms:.0f}ms à la fin"
-        
+
+        self._audio_generation += 1
         self.is_cut_applied = True
         self.cut_status_label.config(text=cut_desc)
-        
+
+        # Une découpe change l'axe des temps: une correction manuelle antérieure
+        # ne correspondrait plus à la bonne position.
+        self.manual_onset_override = None
+        self.manual_offset_override = None
+
         self.invalidate_cache()
         self.update_analysis()
-        
+        self.save_session()
+
         messagebox.showinfo("Découpe appliquée", cut_desc)
     
     def undo_cut(self, silent=False):
@@ -714,12 +874,17 @@ class VoiceKeyAnalyzer:
             return
         
         self.audio_data = self.original_audio_data.copy()
+        self._audio_generation += 1
         self.is_cut_applied = False
         self.cut_status_label.config(text="")
-        
+
+        self.manual_onset_override = None
+        self.manual_offset_override = None
+
         self.invalidate_cache()
         self.update_analysis()
-        
+        self.save_session()
+
         # Only show messagebox when not called silently
         if not silent:
             messagebox.showinfo("Annulation", "Découpe annulée, fichier original restauré")
@@ -759,7 +924,12 @@ class VoiceKeyAnalyzer:
         """CHANGE 3: Play audio on a daemon thread to avoid UI freeze."""
         if self.audio_data is None:
             return
-        
+
+        # CHANGE 7: defensive guard in case the button state gets out of sync
+        if not PYAUDIO_AVAILABLE:
+            messagebox.showerror("Erreur", "La lecture audio est indisponible (PortAudio/pyaudio non installé).")
+            return
+
         self.is_playing = True
         self.playback_position_sec = 0.0
         self.play_button.config(text="⏸ Pause")
@@ -769,33 +939,38 @@ class VoiceKeyAnalyzer:
 
         def _audio_thread():
             """Audio playback runs in background thread."""
+            p = None
+            stream = None
             try:
                 p = pyaudio.PyAudio()
                 audio_int16 = (self.audio_data * 32767).astype(np.int16)
-                
+
                 stream = p.open(format=pyaudio.paInt16,
                               channels=1,
                               rate=self.sample_rate,
                               output=True)
-                
-                chunk_size = 1024
-                for i in range(0, len(audio_int16), chunk_size):
-                    if not self.is_playing:
-                        break
-                    chunk = audio_int16[i:i + chunk_size]
-                    stream.write(chunk.tobytes())
-                    # Update playback position safely
-                    self.playback_position_sec = (i + chunk_size) / self.sample_rate
-                
-                stream.stop_stream()
-                stream.close()
-                p.terminate()
+
+                try:
+                    chunk_size = 1024
+                    for i in range(0, len(audio_int16), chunk_size):
+                        if not self.is_playing:
+                            break
+                        chunk = audio_int16[i:i + chunk_size]
+                        stream.write(chunk.tobytes())
+                        # Update playback position safely
+                        self.playback_position_sec = (i + chunk_size) / self.sample_rate
+                finally:
+                    # CHANGE 6: guarantee stream/PyAudio teardown even if write() raises partway through
+                    stream.stop_stream()
+                    stream.close()
 
             except Exception as e:
                 # CHANGE 4f: Report audio errors from thread via main thread
                 self.root.after(0, lambda: messagebox.showerror(
                     "Erreur", f"Erreur de lecture audio: {str(e)}"))
             finally:
+                if p is not None:
+                    p.terminate()
                 # Safely update UI from thread
                 self.is_playing = False
                 self.root.after(0, lambda: self.play_button.config(text="▶ Jouer"))
@@ -811,18 +986,110 @@ class VoiceKeyAnalyzer:
         self.playback_position_sec = 0.0  # CHANGE 3: Reset position
         self.play_button.config(text="▶ Jouer")
     
+    def _file_status(self, stem):
+        """Statut d'un fichier pour la liste: revu (sauvegardé), personnalisé, ou non revu."""
+        if any(r['filename'] == stem for r in self.results):
+            return 'reviewed'
+        if stem in self.file_specific_params:
+            return 'customized'
+        return 'unreviewed'
+
+    def _sync_tree_selection(self):
+        """Met en surbrillance le fichier courant dans la liste, sans reconstruire la liste."""
+        if not hasattr(self, 'file_tree') or not self.wav_files:
+            return
+        stem = Path(self.wav_files[self.current_index]).stem
+        if not self.file_tree.exists(stem):
+            return
+        self._syncing_tree = True
+        try:
+            self.file_tree.selection_set(stem)
+            self.file_tree.see(stem)
+        finally:
+            self._syncing_tree = False
+
+    def _refresh_file_list(self):
+        """Reconstruit la liste de fichiers avec le statut à jour de chacun."""
+        if not hasattr(self, 'file_tree'):
+            return
+        status_labels = {'reviewed': 'Revu', 'customized': 'Personnalisé', 'unreviewed': 'Non revu'}
+        self._syncing_tree = True
+        try:
+            self.file_tree.delete(*self.file_tree.get_children())
+            for f in self.wav_files:
+                stem = Path(f).stem
+                status = self._file_status(stem)
+                self.file_tree.insert('', tk.END, iid=stem, text=f,
+                                       values=(status_labels[status],), tags=(status,))
+        finally:
+            self._syncing_tree = False
+        self._sync_tree_selection()
+
+    def _on_file_tree_select(self, event):
+        """Navigue vers le fichier sélectionné dans la liste."""
+        if self._syncing_tree:
+            return
+        selection = self.file_tree.selection()
+        if not selection:
+            return
+        stem = selection[0]
+        for i, f in enumerate(self.wav_files):
+            if Path(f).stem == stem:
+                if i != self.current_index:
+                    self.stop_audio()
+                    self.current_index = i
+                    self.load_current_file()
+                return
+
+    def _session_file_path(self):
+        """Chemin du fichier de session pour le répertoire actuellement ouvert."""
+        if not self.directory:
+            return None
+        return os.path.join(self.directory, SESSION_FILENAME)
+
+    def save_session(self):
+        """Enregistre silencieusement les paramètres/résultats dans le répertoire ouvert."""
+        path = self._session_file_path()
+        if path is None:
+            return
+        data = {
+            'file_specific_params': self.file_specific_params,
+            'results': self.results,
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, cls=NumpyJSONEncoder, indent=2, ensure_ascii=False)
+        except OSError as e:
+            print(f"Impossible d'enregistrer la session ({path}): {e}")
+
+    def load_session(self):
+        """Recharge les paramètres/résultats d'une session précédente, si présente."""
+        path = self._session_file_path()
+        if path is None or not os.path.exists(path):
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showwarning("Session", f"Impossible de charger la session précédente: {e}")
+            return
+        self.file_specific_params = data.get('file_specific_params', {})
+        self.results = data.get('results', [])
+
     def select_directory(self):
         directory = filedialog.askdirectory(
             title="Sélectionner le répertoire contenant les fichiers WAV")
-        
+
         if directory:
             self.directory = directory
             self.dir_label.config(text=directory)
-            
+
             # wav_files contains only basenames (os.listdir output)
-            self.wav_files = sorted([f for f in os.listdir(directory) 
+            self.wav_files = sorted([f for f in os.listdir(directory)
                                     if f.lower().endswith('.wav')])
-            
+            self.load_session()
+            self._refresh_file_list()
+
             if self.wav_files:
                 self.current_index = 0
                 self.load_current_file()
@@ -835,35 +1102,47 @@ class VoiceKeyAnalyzer:
     def load_current_file(self):
         if not self.wav_files:
             return
-        
+
         # 4a: wav_files contains basenames; os.path.join adds directory correctly
         filepath = os.path.join(self.directory, self.wav_files[self.current_index])
         filename = Path(self.wav_files[self.current_index]).stem
-        
-        self.sample_rate, audio_raw = wavfile.read(filepath)
-        
-        if audio_raw.dtype == np.int16:
-            self.audio_data = audio_raw.astype(np.float32) / 32768.0
-        elif audio_raw.dtype == np.int32:
-            self.audio_data = audio_raw.astype(np.float32) / 2147483648.0
+
+        try:
+            self.sample_rate, audio_data, was_multichannel = core.load_wav(filepath)
+        except ValueError as e:
+            self._warn("Erreur de lecture", str(e))
+            self.audio_data = None
+            self.detection_result = None
+            self.onset_time = None
+            self.offset_time = None
+            self.update_result_labels()
+            self.file_label.config(
+                text=f"Fichier: {self.wav_files[self.current_index]} (échec du chargement) "
+                     f"({self.current_index + 1}/{len(self.wav_files)})")
+            self.plot_waveform()
+            self._sync_tree_selection()
+            return
+
+        self.audio_data = audio_data
+        self._audio_generation += 1
+
+        if was_multichannel:
+            self.channel_warning_label.config(text="⚠ Fichier multicanal : seul le canal 1 est utilisé")
         else:
-            self.audio_data = audio_raw.astype(np.float32)
-        
-        if len(self.audio_data.shape) > 1:
-            self.audio_data = self.audio_data[:, 0]
-        
+            self.channel_warning_label.config(text="")
+
         self.original_audio_data = None
         self.is_cut_applied = False
         self.cut_start_ms.set(0)
         self.cut_end_ms.set(0)
         self.cut_status_label.config(text="")
-        
+
         file_duration_ms = len(self.audio_data) / self.sample_rate * 1000
         if file_duration_ms < self.noise_window_ms.get():
-            messagebox.showwarning("Attention", 
+            self._warn("Attention",
                 f"Le fichier ({file_duration_ms:.0f}ms) est plus court que la fenêtre de bruit ({self.noise_window_ms.get():.0f}ms). "
                 "La détection adaptative pourrait échouer.")
-        
+
         if filename in self.file_specific_params:
             params = self.file_specific_params[filename]
             self.adaptive_threshold.set(params['adaptive'])
@@ -882,14 +1161,36 @@ class VoiceKeyAnalyzer:
                 self.offset_min_duration_ms.set(params['offset_min_duration_ms'])
             self.noise_reduction.set(params['noise_reduction'])
             self.highpass_freq.set(params['highpass_freq'])
+            self.manual_onset_override = params.get('manual_onset_override')
+            self.manual_offset_override = params.get('manual_offset_override')
             self.toggle_adaptive_mode()
-        
+        else:
+            # CHANGE 2: no saved customization for this file — explicitly reset every
+            # relevant Tk variable to defaults so it never inherits whatever was left
+            # on-screen from the previously viewed file (mirrors reset_to_default()).
+            self.adaptive_threshold.set(True)
+            self.nSD.set(self.default_params['nSD'])
+            self.minTH.set(self.default_params['minTH'])
+            self.min_duration_ms.set(self.default_params['min_duration_ms'])
+            self.noise_window_ms.set(self.default_params['noise_window_ms'])
+            self.search_delay_ms.set(self.default_params['search_delay_ms'])
+            self.manual_onset_threshold.set(self.default_params['manual_onset_threshold'])
+            self.manual_offset_threshold.set(self.default_params['manual_offset_threshold'])
+            self.manual_search_delay_ms.set(self.default_params['search_delay_ms'])
+            self.noise_reduction.set(self.default_params['noise_reduction'])
+            self.highpass_freq.set(self.default_params['highpass_freq'])
+            self.offset_min_duration_ms.set(self.default_params['offset_min_duration_ms'])
+            self.manual_onset_override = None
+            self.manual_offset_override = None
+            self.toggle_adaptive_mode()
+
         self.file_label.config(
             text=f"Fichier: {self.wav_files[self.current_index]} ({self.current_index + 1}/{len(self.wav_files)})")
-        
+        self._sync_tree_selection()
+
         self.invalidate_cache()
         self.detection_result = None
-        
+
         self.update_analysis()
     
     def save_current_params(self):
@@ -911,32 +1212,64 @@ class VoiceKeyAnalyzer:
             'manual_search_delay_ms': self.manual_search_delay_ms.get(),
             'noise_reduction': self.noise_reduction.get(),
             'highpass_freq': self.highpass_freq.get(),
-            'offset_min_duration_ms': self.offset_min_duration_ms.get()
+            'offset_min_duration_ms': self.offset_min_duration_ms.get(),
+            'manual_onset_override': self.manual_onset_override,
+            'manual_offset_override': self.manual_offset_override
         }
     
     def invalidate_cache(self):
         """Invalidate envelope cache"""
         self.cached_envelope = None
         self.cached_envelope_params = None
-    
+
+    def _warn(self, title, message):
+        """Show a warning, batch-mode aware.
+
+        Interactive (not batch): behaves exactly like messagebox.showwarning today.
+        Batch mode: never blocks the whole run on a modal messagebox. If the user
+        already chose to suppress remaining warnings, just record it silently;
+        otherwise show a small non-blocking-to-the-batch Toplevel with an option
+        to suppress the rest. Either way the warning is recorded in
+        self._batch_warnings so the end-of-batch summary can report a count.
+        """
+        if not self._batch_mode:
+            messagebox.showwarning(title, message)
+            return
+
+        self._batch_warnings.append((title, message))
+
+        if self._suppress_batch_warnings:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        msg_label = tk.Label(dialog, text=message, justify=tk.LEFT, wraplength=380, padx=10, pady=10)
+        msg_label.pack()
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(pady=10)
+
+        def _on_ok():
+            dialog.destroy()
+
+        def _on_suppress():
+            self._suppress_batch_warnings = True
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="OK", command=_on_ok).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Ignorer les avertissements restants pour ce traitement",
+                   command=_on_suppress).pack(side=tk.LEFT, padx=5)
+
+        dialog.wait_window()
+
     def apply_noise_reduction(self, data):
         """Applique un filtre passe-haut pour réduire le bruit de fond"""
-        if not self.noise_reduction.get():
-            return data
-        
-        nyquist = self.sample_rate / 2
-        cutoff = self.highpass_freq.get() / nyquist
-        
-        if cutoff >= 1.0:
-            cutoff = 0.99
-        if cutoff <= 0.0:
-            cutoff = 0.01
-            
-        b, a = signal.butter(4, cutoff, btype='high')
-        filtered = signal.filtfilt(b, a, data)
-        
-        return filtered
-    
+        return core.apply_highpass(data, self.sample_rate, self.highpass_freq.get(),
+                                    enabled=self.noise_reduction.get())
+
     def get_envelope_cache_key(self):
         """Generate cache key for envelope computation"""
         return (
@@ -945,170 +1278,54 @@ class VoiceKeyAnalyzer:
             self.frame_length_ms.get(),
             self.hop_length_ms.get(),
             len(self.audio_data),
-            id(self.audio_data)
+            self._audio_generation
         )
-    
+
     def compute_rms_envelope(self, data):
-        """Compute RMS envelope with caching - shared by both modes"""
+        """Compute RMS envelope with caching - shared by both modes.
+
+        Thin caching wrapper: on a cache hit, returns the cached arrays; on a
+        miss, delegates the actual computation to core.compute_rms_envelope.
+        """
         cache_key = self.get_envelope_cache_key()
         if self.cached_envelope is not None and self.cached_envelope_params == cache_key:
             return self.cached_envelope, self.cached_envelope_times
-        
-        frame_length = int(self.frame_length_ms.get() / 1000 * self.sample_rate)
-        hop_length = int(self.hop_length_ms.get() / 1000 * self.sample_rate)
-        
-        if frame_length < 1:
-            frame_length = 1
-        if hop_length < 1:
-            hop_length = 1
-        
-        win = hann(frame_length)
-        
-        rms_env = []
-        times_rms = []
-        for i in range(0, len(data) - frame_length, hop_length):
-            rms_val = np.sqrt(np.mean((data[i : i + frame_length] * win)**2))
-            rms_env.append(rms_val)
-            times_rms.append((i + frame_length // 2) / self.sample_rate)
-        
-        rms_env = np.array(rms_env)
-        times_rms = np.array(times_rms)
-        
-        if len(times_rms) > 1:
-            interp_func = interp1d(times_rms, rms_env, kind='linear', 
-                                   bounds_error=False, fill_value=(rms_env[0], rms_env[-1]))
-            full_times = np.arange(len(data)) / self.sample_rate
-            env_full = interp_func(full_times)
-        else:
-            env_full = np.full(len(data), rms_env[0] if len(rms_env) > 0 else 0.0)
-            full_times = np.arange(len(data)) / self.sample_rate
-        
+
+        env_full, full_times = core.compute_rms_envelope(
+            data, self.sample_rate, self.frame_length_ms.get(), self.hop_length_ms.get())
+
         self.cached_envelope = env_full
         self.cached_envelope_times = full_times
         self.cached_envelope_params = cache_key
-        
+
         return env_full, full_times
-    
-    def find_sustained_crossing(self, envelope, threshold, start_idx, min_duration_sec, direction='above'):
-        """
-        CHANGE 2: Find sustained crossing of threshold.
-        direction='above' for onset (forward search).
-        direction='below' for offset (FIXED: forward search from onset).
-        """
-        min_samples = max(1, int(min_duration_sec * self.sample_rate))
-        
-        if direction == 'above':
-            # Forward search: find first sustained rise above threshold
-            for i in range(start_idx, len(envelope)):
-                end_idx = min(i + min_samples, len(envelope))
-                if np.all(envelope[i:end_idx] > threshold):
-                    return i
-            return None
-        else:  # 'below' — FIXED: forward search from onset
-            # Find first position after onset where signal stays below threshold
-            for i in range(start_idx, len(envelope) - min_samples + 1):
-                if np.all(envelope[i : i + min_samples] < threshold):
-                    return i
-            # Fallback: last sample above threshold after onset
-            above = np.where(envelope[start_idx:] > threshold)[0]
-            if len(above) > 0:
-                return start_idx + above[-1]
-            return start_idx
-    
+
     def compute_voice_onset_voat(self, data):
         """Algorithme VOAT pour la détection d'onset ET offset"""
-        y = data - np.mean(data)
-        
-        env_full, full_times = self.compute_rms_envelope(y)
-        
-        noise_samples = int(self.noise_window_ms.get() / 1000 * self.sample_rate)
-        
-        if noise_samples > len(env_full):
-            noise_samples = max(1, len(env_full) // 10)
-        
-        noise_region = env_full[:noise_samples]
-        noise_mean = np.mean(noise_region)
-        noise_std = np.std(noise_region)
-        
-        threshold_nSD = noise_mean + (noise_std * self.nSD.get())
-        peak_loudness = np.max(env_full)
-        threshold_minTH = self.minTH.get() * peak_loudness
-        
-        sound_threshold = max(threshold_nSD, threshold_minTH)
-        
-        search_delay_sec = self.search_delay_ms.get() / 1000
-        search_start_idx = np.searchsorted(full_times, search_delay_sec)
-        
-        if search_start_idx >= len(env_full):
-            return None
-        
-        min_onset_duration_sec = self.min_duration_ms.get() / 1000
-        onset_idx = self.find_sustained_crossing(env_full, sound_threshold, 
-                                                  search_start_idx, min_onset_duration_sec, 
-                                                  direction='above')
-        
-        if onset_idx is None:
-            return None
-        
-        # CHANGE 2: Use corrected find_sustained_crossing (handles fallback internally)
-        min_offset_duration_sec = self.offset_min_duration_ms.get() / 1000
-        offset_idx = self.find_sustained_crossing(env_full, sound_threshold, 
-                                                   onset_idx, min_offset_duration_sec, 
-                                                   direction='below')
+        return core.compute_voice_onset_voat(
+            data, self.sample_rate,
+            nSD=self.nSD.get(),
+            minTH=self.minTH.get(),
+            min_duration_ms=self.min_duration_ms.get(),
+            noise_window_ms=self.noise_window_ms.get(),
+            search_delay_ms=self.search_delay_ms.get(),
+            frame_length_ms=self.frame_length_ms.get(),
+            hop_length_ms=self.hop_length_ms.get(),
+            offset_min_duration_ms=self.offset_min_duration_ms.get()
+        )
 
-        # CHANGE 2: Unified fallback — ensure offset is strictly after onset, clamped to valid range
-        if offset_idx <= onset_idx:
-            offset_idx = onset_idx + 1
-        offset_idx = min(offset_idx, len(env_full) - 1)
-
-        t_onset = full_times[onset_idx]
-        t_offset = full_times[offset_idx]
-        
-        return {
-            "t_onset": t_onset,
-            "t_offset": t_offset,
-            "onset_sample": onset_idx,
-            "offset_sample": offset_idx,
-            "threshold": sound_threshold,
-            "threshold_nSD": threshold_nSD,
-            "threshold_minTH": threshold_minTH,
-            "peak": peak_loudness,
-            "noise_mean": noise_mean,
-            "noise_std": noise_std,
-            "envelope": env_full,
-            "envelope_times": full_times
-        }
-    
     def detect_speech_boundaries_manual(self, data):
         """Détection avec seuils manuels - symmetric with adaptive mode"""
-        envelope, time_axis = self.compute_rms_envelope(data)
-        
-        onset_thresh = self.manual_onset_threshold.get()
-        offset_thresh = self.manual_offset_threshold.get()
-        
-        search_delay_sec = self.manual_search_delay_ms.get() / 1000
-        search_start_idx = np.searchsorted(time_axis, search_delay_sec)
-        
-        if search_start_idx >= len(envelope):
-            search_start_idx = 0
-        
-        min_onset_duration_sec = self.min_duration_ms.get() / 1000
-        onset_idx = self.find_sustained_crossing(envelope, onset_thresh, 
-                                                  search_start_idx, min_onset_duration_sec, 
-                                                  direction='above')
-        
-        offset_idx = None
-        if onset_idx is not None:
-            # CHANGE 2: Use corrected forward search; fallback handled internally
-            min_offset_duration_sec = self.offset_min_duration_ms.get() / 1000
-            offset_idx = self.find_sustained_crossing(envelope, offset_thresh, 
-                                                       onset_idx, min_offset_duration_sec, 
-                                                       direction='below')
-            # CHANGE 2: Ensure offset strictly after onset
-            if offset_idx is not None and offset_idx <= onset_idx:
-                offset_idx = onset_idx + 1
-        
-        return onset_idx, offset_idx, envelope, time_axis
+        return core.detect_speech_boundaries_manual(
+            data, self.sample_rate,
+            manual_onset_threshold=self.manual_onset_threshold.get(),
+            manual_offset_threshold=self.manual_offset_threshold.get(),
+            manual_search_delay_ms=self.manual_search_delay_ms.get(),
+            min_duration_ms=self.min_duration_ms.get(),
+            offset_min_duration_ms=self.offset_min_duration_ms.get(),
+            frame_length_ms=self.frame_length_ms.get(),
+            hop_length_ms=self.hop_length_ms.get()
+        )
     
     def update_analysis(self):
         """Met à jour l'analyse et le graphique"""
@@ -1170,7 +1387,16 @@ class VoiceKeyAnalyzer:
             
             info_text = f"Mode manuel | Onset: >{self.manual_onset_threshold.get():.3f} ({self.min_duration_ms.get():.0f}ms) | Offset: <{self.manual_offset_threshold.get():.3f} ({self.offset_min_duration_ms.get():.0f}ms)"
             self.threshold_info_label.config(text=info_text)
-        
+
+        # Une correction manuelle (glisser-déposer) prime toujours sur la détection
+        # automatique, quel que soit le mode, jusqu'à annulation explicite.
+        if self.manual_onset_override is not None:
+            self.onset_time = self.manual_onset_override
+            self.onset_sample = int(self.onset_time * self.sample_rate)
+        if self.manual_offset_override is not None:
+            self.offset_time = self.manual_offset_override
+            self.offset_sample = int(self.offset_time * self.sample_rate)
+
         self.update_result_labels()
         self.plot_waveform()
     
@@ -1194,7 +1420,18 @@ class VoiceKeyAnalyzer:
                 self.duration_label.config(text=f"Durée: ERREUR (offset avant onset)", foreground='red')
         else:
             self.duration_label.config(text="Durée: -", foreground='black')
-    
+
+        onset_corrected = self.manual_onset_override is not None
+        offset_corrected = self.manual_offset_override is not None
+        if onset_corrected and offset_corrected:
+            self.manual_correction_label.config(text="✓ Onset et offset corrigés manuellement")
+        elif onset_corrected:
+            self.manual_correction_label.config(text="✓ Onset corrigé manuellement")
+        elif offset_corrected:
+            self.manual_correction_label.config(text="✓ Offset corrigé manuellement")
+        else:
+            self.manual_correction_label.config(text="")
+
     def plot_waveform(self):
         """Affiche la forme d'onde avec les marqueurs"""
         self.ax1.clear()
@@ -1209,7 +1446,7 @@ class VoiceKeyAnalyzer:
         self._offset_vline = None
         
         if self.audio_data is None:
-            self.canvas.draw()
+            self.canvas.draw_idle()
             return
         
         time_axis = np.arange(len(self.audio_data)) / self.sample_rate
@@ -1258,9 +1495,10 @@ class VoiceKeyAnalyzer:
             self._offset_vline = self.ax2.axvline(x=self.offset_time, color='darkblue', 
                            linestyle='-', linewidth=2.5, label=f'Offset ({self.offset_time*1000:.1f}ms)', alpha=0.8)
         
-        # CHANGE 1: Add manual mode hint annotation in lower-right of ax2
-        if not self.adaptive_threshold.get():
-            self.ax2.text(0.98, 0.04, "Manuel: glissez les marqueurs",
+        # Rappel: les marqueurs onset/offset peuvent être glissés pour les corriger,
+        # quel que soit le mode de détection.
+        if self.onset_time is not None or self.offset_time is not None:
+            self.ax2.text(0.98, 0.04, "Glissez les marqueurs pour corriger",
                          transform=self.ax2.transAxes,
                          ha='right', va='bottom', fontsize=7,
                          alpha=0.4, color='black')
@@ -1274,8 +1512,8 @@ class VoiceKeyAnalyzer:
         self.ax2.grid(True, alpha=0.3)
         
         self.fig.tight_layout()
-        self.canvas.draw()
-    
+        self.canvas.draw_idle()
+
     def save_current(self):
         """Sauvegarde les résultats du fichier actuel"""
         if not self.wav_files:
@@ -1301,7 +1539,9 @@ class VoiceKeyAnalyzer:
             'frame_length_ms': self.frame_length_ms.get(),
             'hop_length_ms': self.hop_length_ms.get(),
             'min_duration_ms': self.min_duration_ms.get(),
-            'offset_min_duration_ms': self.offset_min_duration_ms.get()
+            'offset_min_duration_ms': self.offset_min_duration_ms.get(),
+            'manually_corrected_onset': self.manual_onset_override is not None,
+            'manually_corrected_offset': self.manual_offset_override is not None
         }
         
         if self.adaptive_threshold.get() and self.detection_result:
@@ -1327,7 +1567,9 @@ class VoiceKeyAnalyzer:
         # 4b: Deduplication runs before append — verified correct
         self.results = [r for r in self.results if r['filename'] != filename]
         self.results.append(result)
-    
+        self._refresh_file_list()
+        self.save_session()
+
     def process_all(self):
         """Traite tous les fichiers automatiquement et sauvegarde tous les résultats"""
         if not self.wav_files:
@@ -1342,48 +1584,61 @@ class VoiceKeyAnalyzer:
         
         if not response:
             return
-        
+
+        self._batch_mode = True
+        self._batch_warnings = []
+        self._suppress_batch_warnings = False
+
         progress_window = tk.Toplevel(self.root)
         progress_window.title("Traitement en cours")
         progress_window.geometry("400x150")
         progress_window.transient(self.root)
         progress_window.grab_set()
-        
+
         status_label = tk.Label(progress_window, text="Initialisation...", font=("Arial", 10))
         status_label.pack(pady=10)
-        
-        progress_bar = ttk.Progressbar(progress_window, length=350, 
+
+        progress_bar = ttk.Progressbar(progress_window, length=350,
                                     mode='determinate', maximum=len(self.wav_files))
         progress_bar.pack(pady=10)
-        
+
         counter_label = tk.Label(progress_window, text="0 / " + str(len(self.wav_files)), font=("Arial", 9))
         counter_label.pack(pady=5)
-        
+
         self.results = []
-        
+
         def process_next(index):
             if index < len(self.wav_files):
                 # 4a: os.path.basename on wav_files[index] is already a basename
                 filename = os.path.basename(self.wav_files[index])
                 status_label.config(text=f"Traitement: {filename}")
                 counter_label.config(text=f"{index + 1} / {len(self.wav_files)}")
-                
+
                 self.current_index = index
-                self.load_current_file()
-                self.save_current()
-                
+                try:
+                    self.load_current_file()
+                    if self.audio_data is not None:
+                        self.save_current()
+                except Exception as e:
+                    self._warn("Erreur de traitement", f"Impossible de traiter {filename}: {e}")
+
                 progress_bar['value'] = index + 1
                 progress_window.update()
-                
+
                 self.root.after(10, lambda: process_next(index + 1))
             else:
                 progress_window.destroy()
+                self._batch_mode = False
+                self._refresh_file_list()
+                self.save_session()
                 message = (f"Traitement terminé!\n\n"
                           f"• {len(self.results)} fichiers traités\n"
                           f"• Résultats sauvegardés en mémoire\n\n"
                           f"Cliquez sur 'Exporter CSV' pour sauvegarder les résultats")
+                if self._batch_warnings:
+                    message += f"\n\n⚠ {len(self._batch_warnings)} avertissement(s) survenu(s) pendant le traitement"
                 messagebox.showinfo("Terminé", message)
-        
+
         process_next(0)
 
     def export_csv(self):
@@ -1422,5 +1677,6 @@ class VoiceKeyAnalyzer:
 
 if __name__ == "__main__":
     root = tk.Tk()
+    sv_ttk.set_theme("light")
     app = VoiceKeyAnalyzer(root)
     root.mainloop()
