@@ -13,7 +13,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # This app only needs numpy/scipy/pandas/matplotlib/pyaudio/sv_ttk; the build
+    # environment also has an unrelated ML stack installed that PyInstaller's
+    # static analysis otherwise pulls in, bloating the exe by ~150MB for nothing.
+    excludes=['torch', 'torchvision', 'torchaudio', 'llvmlite', 'numba',
+              'onnx', 'onnxruntime', 'sklearn', 'IPython', 'jupyter', 'notebook',
+              'tensorflow', 'tensorboard', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6',
+              'lxml', 'Cython'],
     noarchive=False,
     optimize=0,
 )
