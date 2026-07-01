@@ -13,12 +13,15 @@ Outil graphique (Tkinter) pour détecter automatiquement ou manuellement l'onset
 
 ## Installation
 
+**Windows, sans Python :** téléchargez `VoiceKeyAnalyzer.exe` depuis la [dernière version publiée](https://github.com/clmntlts/voicekey_analyser/releases/latest) et lancez-le directement.
+
+**Depuis les sources :**
 ```
 pip install -r requirements.txt
 python analyse_voicekey.py
 ```
 
-Un exécutable Windows autonome peut être construit avec `pyinstaller VoiceKeyAnalyzer.spec`.
+Pour reconstruire l'exécutable : `pyinstaller VoiceKeyAnalyzer.spec`.
 
 ## Documentation
 
